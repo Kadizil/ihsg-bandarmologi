@@ -95,6 +95,35 @@ def adjust_for_splits(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean_notrade_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Fix two recurring BEI Ringkasan Saham data quirks that otherwise corrupt
+    candlestick charts and range/breakout metrics:
+
+    1. Suspended / no-trade days: Volume == 0 and Open/High/Low reported as 0
+       while Penutupan still carries the last known price forward. Left as-is,
+       a candlestick chart draws a wick straight down to zero on that day.
+    2. Illiquid days with real Volume/High/Low/Close but no recorded opening
+       cross: Open Price (and First Trade) reported as 0. Left as-is, the
+       candle body starts from zero and `close > open` is trivially true,
+       which can produce false breakout signals.
+
+    Both are fixed by substituting a sensible reference price instead of 0,
+    rather than plotting/scoring off the literal zero.
+    """
+    df = df.copy()
+
+    no_trade = df["Volume"] == 0
+    for c in ["Open Price", "First Trade", "Tertinggi", "Terendah"]:
+        df.loc[no_trade, c] = df.loc[no_trade, "Penutupan"]
+
+    no_open = (df["Open Price"] == 0) & (~no_trade)
+    df.loc[no_open, "Open Price"] = df.loc[no_open, "Sebelumnya"]
+    no_first_trade = (df["First Trade"] == 0) & (~no_trade)
+    df.loc[no_first_trade, "First Trade"] = df.loc[no_first_trade, "Sebelumnya"]
+
+    return df
+
+
 def load_data(source: Union[str, io.BytesIO]) -> pd.DataFrame:
     """Load master_saham.csv safely accepting both file paths and memory buffers."""
     df = pd.read_csv(source)
@@ -115,6 +144,7 @@ def load_data(source: Union[str, io.BytesIO]) -> pd.DataFrame:
 
     df = df.dropna(subset=[DATE_COL, CODE_COL])
     df = df.sort_values([CODE_COL, DATE_COL]).reset_index(drop=True)
+    df = clean_notrade_rows(df)
     df = adjust_for_splits(df)
     return df
 
