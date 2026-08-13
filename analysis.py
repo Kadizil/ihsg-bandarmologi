@@ -37,6 +37,64 @@ RAW_COLUMNS = [
 # 1. LOAD DATA
 # --------------------------------------------------------------------------
 
+
+# Columns that represent a per-share price level. Rescaled when a split is detected.
+_SPLIT_PRICE_COLS = ["Sebelumnya", "Open Price", "First Trade", "Tertinggi",
+                      "Terendah", "Penutupan", "Selisih", "Offer", "Bid"]
+# Columns that represent a share/volume count. Inversely rescaled when a split is detected.
+_SPLIT_VOLUME_COLS = ["Volume", "Listed Shares", "Tradeble Shares", "Weight For Index",
+                       "Offer Volume", "Bid Volume", "Foreign Sell", "Foreign Buy",
+                       "Non Regular Volume"]
+
+# A day-over-day ratio between our own computed previous close and BEI's
+# official "Sebelumnya" field outside this band is treated as a stock
+# split / reverse split rather than a genuine price move.
+_SPLIT_RATIO_LOW, _SPLIT_RATIO_HIGH = 0.7, 1.3
+
+
+def adjust_for_splits(df: pd.DataFrame) -> pd.DataFrame:
+    """Detect stock splits / reverse splits and retroactively rescale historical
+    price & volume columns so a single ticker's window is on one consistent
+    per-share basis.
+
+    BEI reports "Sebelumnya" (official previous close) already adjusted for
+    any split that just happened. If that disagrees sharply with the close we
+    compute ourselves from the prior row, a split occurred between the two
+    rows — everything for that code *before* the split date gets rescaled by
+    the implied factor so momentum/volatility/volume metrics aren't corrupted
+    by the artificial price jump.
+    """
+    df = df.sort_values([CODE_COL, DATE_COL]).reset_index(drop=True)
+    # Source columns are int64 (whole-Rupiah / whole-share data); a split
+    # factor produces fractional values, so widen to float64 up front or
+    # pandas refuses the lossy int assignment later.
+    df[_SPLIT_PRICE_COLS] = df[_SPLIT_PRICE_COLS].astype(float)
+    df[_SPLIT_VOLUME_COLS] = df[_SPLIT_VOLUME_COLS].astype(float)
+    prev_close_calc = df.groupby(CODE_COL)["Penutupan"].shift(1)
+
+    valid = prev_close_calc.notna() & (prev_close_calc > 0) & (df["Sebelumnya"] > 0)
+    ratio = df["Sebelumnya"] / prev_close_calc
+    is_split_row = valid & ((ratio < _SPLIT_RATIO_LOW) | (ratio > _SPLIT_RATIO_HIGH))
+
+    if not is_split_row.any():
+        return df
+
+    events = df.loc[is_split_row, [CODE_COL, DATE_COL]].copy()
+    events["split_factor"] = (prev_close_calc[is_split_row] / df.loc[is_split_row, "Sebelumnya"]).values
+
+    for _, ev in events.iterrows():
+        code, split_date, factor = ev[CODE_COL], ev[DATE_COL], ev["split_factor"]
+        if not np.isfinite(factor) or factor <= 0:
+            continue
+        mask = (df[CODE_COL] == code) & (df[DATE_COL] < split_date)
+        if not mask.any():
+            continue
+        df.loc[mask, _SPLIT_PRICE_COLS] = df.loc[mask, _SPLIT_PRICE_COLS].div(factor)
+        df.loc[mask, _SPLIT_VOLUME_COLS] = df.loc[mask, _SPLIT_VOLUME_COLS].mul(factor)
+
+    return df
+
+
 def load_data(source: Union[str, io.BytesIO]) -> pd.DataFrame:
     """Load master_saham.csv safely accepting both file paths and memory buffers."""
     df = pd.read_csv(source)
@@ -57,6 +115,7 @@ def load_data(source: Union[str, io.BytesIO]) -> pd.DataFrame:
 
     df = df.dropna(subset=[DATE_COL, CODE_COL])
     df = df.sort_values([CODE_COL, DATE_COL]).reset_index(drop=True)
+    df = adjust_for_splits(df)
     return df
 
 
@@ -76,7 +135,12 @@ def _safe_div(a: float, b: float) -> float:
 
 def build_stock_features(df: pd.DataFrame, n_days: int = N_LOOKBACK_DAYS) -> pd.DataFrame:
     window_dates, all_dates = get_lookback_window(df, n_days)
-    
+    # get_lookback_window caps the window to however many trading days actually
+    # exist. "Completeness" must be judged against that real length, not the
+    # originally-requested n_days, or every ticker looks incomplete whenever
+    # n_days exceeds the data on hand.
+    n_days = len(window_dates)
+
     # Pre-filter to only the relevant window to save memory
     sub = df[df[DATE_COL].isin(window_dates)].copy()
     sub['net_foreign'] = sub['Foreign Buy'] - sub['Foreign Sell']
@@ -264,13 +328,27 @@ def _pct_rank(series: pd.Series, ascending: bool = True) -> pd.Series:
 def compute_scores(feat: pd.DataFrame) -> pd.DataFrame:
     f = feat.copy()
 
-    p_close_window = _pct_rank(f["close_chg_window"])
-    p_close_last = _pct_rank(f["close_chg_last"])
+    # Percentile ranks should reflect the comparable universe only. Tickers
+    # with an incomplete window (new listings, thin trading) have their own
+    # Overall Score blanked out further below anyway, but if left in here
+    # their partial-window feature values still shift everyone else's
+    # percentile — so exclude them from the ranking basis itself.
+    complete_idx = f.index[f["data_complete"]]
+
+    def _pct_rank_complete(series: pd.Series, ascending: bool = True) -> pd.Series:
+        ranked = pd.Series(50.0, index=series.index)
+        ranked.loc[complete_idx] = _pct_rank(series.loc[complete_idx], ascending=ascending)
+        return ranked
+
+    _pct_rank_scoped = _pct_rank_complete if len(complete_idx) > 0 else _pct_rank
+
+    p_close_window = _pct_rank_scoped(f["close_chg_window"])
+    p_close_last = _pct_rank_scoped(f["close_chg_last"])
     p_breakout = f["breakout"].astype(float) * 100
-    p_vol_spike = _pct_rank(f["vol_spike"])
-    p_vol_accel = _pct_rank(f["vol_chg_last"])
-    p_freq_accel = _pct_rank(f["freq_chg_last"])
-    p_nilai_accel = _pct_rank(f["nilai_chg_last"])
+    p_vol_spike = _pct_rank_scoped(f["vol_spike"])
+    p_vol_accel = _pct_rank_scoped(f["vol_chg_last"])
+    p_freq_accel = _pct_rank_scoped(f["freq_chg_last"])
+    p_nilai_accel = _pct_rank_scoped(f["nilai_chg_last"])
     
     f["Momentum Score"] = (
         0.25 * p_close_window + 0.15 * p_close_last + 0.15 * p_breakout +
@@ -278,22 +356,22 @@ def compute_scores(feat: pd.DataFrame) -> pd.DataFrame:
         0.10 * p_nilai_accel
     )
 
-    p_avg_nilai = _pct_rank(f["avg_nilai_window"])
-    p_avg_vol = _pct_rank(f["avg_vol_window"])
-    p_turnover = _pct_rank(f["turnover_ratio"])
-    p_freefloat = _pct_rank(f["free_float_ratio"])
-    p_depth = _pct_rank(f["Bid Volume"] + f["Offer Volume"])
-    p_consistency = _pct_rank(f["nilai_consistency"])
+    p_avg_nilai = _pct_rank_scoped(f["avg_nilai_window"])
+    p_avg_vol = _pct_rank_scoped(f["avg_vol_window"])
+    p_turnover = _pct_rank_scoped(f["turnover_ratio"])
+    p_freefloat = _pct_rank_scoped(f["free_float_ratio"])
+    p_depth = _pct_rank_scoped(f["Bid Volume"] + f["Offer Volume"])
+    p_consistency = _pct_rank_scoped(f["nilai_consistency"])
     
     f["Liquidity Score"] = (
         0.30 * p_avg_nilai + 0.20 * p_avg_vol + 0.20 * p_turnover +
         0.10 * p_freefloat + 0.10 * p_depth + 0.10 * p_consistency
     )
 
-    p_net_total = _pct_rank(f["net_foreign_total"])
-    p_net_last = _pct_rank(f["net_foreign_last"])
+    p_net_total = _pct_rank_scoped(f["net_foreign_total"])
+    p_net_last = _pct_rank_scoped(f["net_foreign_last"])
     p_accum = f["accumulation"].astype(float) * 100
-    p_f_intensity = _pct_rank(f["foreign_intensity"])
+    p_f_intensity = _pct_rank_scoped(f["foreign_intensity"])
     distribution_penalty = f["distribution"].astype(float) * 25 
     
     f["Foreign Score"] = (
@@ -301,29 +379,33 @@ def compute_scores(feat: pd.DataFrame) -> pd.DataFrame:
         0.15 * p_f_intensity - distribution_penalty
     ).clip(0, 100)
 
-    p_dominance = _pct_rank(f["bid_offer_dominance"])
-    p_imbalance = _pct_rank(f["imbalance"])
-    p_spread = _pct_rank(f["spread_pct"], ascending=False) 
-    p_support = _pct_rank(f["support_gap_pct"], ascending=False) 
+    p_dominance = _pct_rank_scoped(f["bid_offer_dominance"])
+    p_imbalance = _pct_rank_scoped(f["imbalance"])
+    p_spread = _pct_rank_scoped(f["spread_pct"], ascending=False) 
+    # NOTE: rewards being close to the recent low ("near support"). This is a
+    # deliberate mean-reversion assumption, not a bug — flip ascending=True
+    # if you'd rather reward distance *from* the low instead. Also worth a
+    # second look: this is a pure price metric living inside "Orderbook Score".
+    p_support = _pct_rank_scoped(f["support_gap_pct"], ascending=False) 
     
     f["Orderbook Score"] = (
         0.35 * p_dominance + 0.30 * p_imbalance + 0.20 * p_spread + 0.15 * p_support
     )
 
-    p_nr_trend = _pct_rank(f["nr_trend"])
-    p_nr_freq_trend = _pct_rank(f["nr_freq_trend"])
+    p_nr_trend = _pct_rank_scoped(f["nr_trend"])
+    p_nr_freq_trend = _pct_rank_scoped(f["nr_freq_trend"])
     p_block = f["block_trade_flag"].astype(float) * 100
-    p_pv_div = _pct_rank(f["pv_divergence"])
+    p_pv_div = _pct_rank_scoped(f["pv_divergence"])
     
     f["Bandar Activity Score"] = (
         0.30 * p_nr_trend + 0.20 * p_nr_freq_trend + 0.25 * p_block + 0.25 * p_pv_div
     )
 
-    p_low_volatility = _pct_rank(f["volatility"], ascending=False)
-    p_low_spread = _pct_rank(f["spread_pct"], ascending=False)
-    p_high_liquidity = _pct_rank(f["avg_nilai_window"])
+    p_low_volatility = _pct_rank_scoped(f["volatility"], ascending=False)
+    p_low_spread = _pct_rank_scoped(f["spread_pct"], ascending=False)
+    p_high_liquidity = _pct_rank_scoped(f["avg_nilai_window"])
     p_no_distribution = (~f["distribution"]).astype(float) * 100
-    p_freefloat_safety = _pct_rank(f["free_float_ratio"])
+    p_freefloat_safety = _pct_rank_scoped(f["free_float_ratio"])
     
     f["Risk Score"] = (
         0.30 * p_low_volatility + 0.20 * p_low_spread + 0.20 * p_high_liquidity +
