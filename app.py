@@ -60,6 +60,24 @@ DEFAULT_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mas
 
 
 # ==========================================================================
+# FORMATTING HELPERS
+# ==========================================================================
+
+def fmt_id(value, decimals: int = 0, suffix: str = "") -> str:
+    """Format a number Indonesian-style: '.' for thousands, ',' for decimals.
+
+    Replaces the old `f"{v:,.2f}".replace(",", ".")` pattern, which only
+    swapped the thousands separator and left the decimal point untouched —
+    producing ambiguous output like "1.234.57" for values >= 1000.
+    """
+    if value is None or (isinstance(value, (float, int)) and pd.isna(value)):
+        return "N/A"
+    s = f"{value:,.{decimals}f}"
+    s = s.replace(",", "\u0000").replace(".", ",").replace("\u0000", ".")
+    return f"{s} {suffix}".strip()
+
+
+# ==========================================================================
 # DATA LOADING (CACHED)
 # ==========================================================================
 
@@ -103,7 +121,15 @@ lookback_days = st.sidebar.number_input(
     min_value=3, max_value=30, value=A.N_LOOKBACK_DAYS, step=1,
 )
 
-raw_df, scored_all, window_dates = cached_pipeline(source, int(lookback_days))
+try:
+    raw_df, scored_all, window_dates = cached_pipeline(source, int(lookback_days))
+except Exception as e:
+    st.error(
+        f"Gagal memproses dataset: {e}\n\n"
+        "Pastikan file CSV punya semua kolom Ringkasan Saham yang dibutuhkan "
+        "dan formatnya sesuai (lihat `master_saham.csv` bawaan sebagai contoh)."
+    )
+    st.stop()
 latest_date = window_dates[-1]
 
 st.sidebar.markdown("---")
@@ -167,9 +193,9 @@ breadth_pct = 100 * advancers / total_moves
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Latest Session", latest_date.strftime("%Y-%m-%d"))
-m2.metric("Total Universe", f"{complete.shape[0]:,}".replace(",", "."))
-m3.metric("Filtered Candidates", f"{screened.shape[0]:,}".replace(",", "."))
-m4.metric("Avg Net Foreign", f"{avg_net_foreign/1e9:,.2f} M".replace(",", "."))
+m2.metric("Total Universe", fmt_id(complete.shape[0]))
+m3.metric("Filtered Candidates", fmt_id(screened.shape[0]))
+m4.metric("Avg Net Foreign", fmt_id(avg_net_foreign/1e9, 2, "M"))
 m5.metric("Market Breadth", f"{breadth_pct:.0f}% Up", f"{advancers}↑ / {decliners}↓")
 
 st.markdown("---")
@@ -177,6 +203,9 @@ st.markdown("---")
 all_codes = sorted(scored_all["Kode Saham"].unique().tolist())
 if search_query:
     matched_codes = [c for c in all_codes if search_query in c]
+    if not matched_codes:
+        st.sidebar.warning(f"Kode '{search_query}' tidak ditemukan.")
+        matched_codes = all_codes[:10]
 else:
     matched_codes = top10["Kode Saham"].tolist() or all_codes[:10]
 
@@ -213,7 +242,7 @@ with right_col:
         sc1, sc2, sc3, sc4 = st.columns(4)
         sc1.metric("Overall Score", f"{row['Overall Score']:.1f}" if pd.notna(row["Overall Score"]) else "N/A")
         sc2.metric("Signal", row["Signal"])
-        sc3.metric("Last Close", f"{row['Penutupan']:,.0f}".replace(",", "."))
+        sc3.metric("Last Close", fmt_id(row["Penutupan"]))
         sc4.metric("Change", f"{row['close_chg_last']*100:.2f}%" if pd.notna(row["close_chg_last"]) else "N/A")
 
         tabs = st.tabs(["💹 Price", "📊 Volume", "🌐 Foreign Flow", "💰 Value", "📗 Orderbook", "🧊 Non Regular", "📋 Synopsis"])
@@ -239,7 +268,7 @@ with right_col:
             colA, colB, colC = st.columns(3)
             colA.metric("Last Vol Change", f"{row['vol_chg_last']*100:.1f}%" if pd.notna(row['vol_chg_last']) else "N/A")
             colB.metric("Volume Spike", f"{row['vol_spike']:.2f}x" if pd.notna(row['vol_spike']) else "N/A")
-            colC.metric(f"Avg Vol ({lookback_days}D)", f"{row['avg_vol_window']:,.0f}".replace(",", "."))
+            colC.metric(f"Avg Vol ({lookback_days}D)", fmt_id(row["avg_vol_window"]))
 
         with tabs[2]:
             fig = go.Figure()
@@ -251,7 +280,7 @@ with right_col:
             fig.update_layout(template=PLOTLY_TEMPLATE, barmode="relative", height=380, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
             colA, colB, colC = st.columns(3)
-            colA.metric(f"Net Foreign ({lookback_days}D)", f"{row['net_foreign_total']/1e9:,.2f} M".replace(",", "."))
+            colA.metric(f"Net Foreign ({lookback_days}D)", fmt_id(row["net_foreign_total"]/1e9, 2, "M"))
             status = "Accumulating 📈" if row["accumulation"] else ("Distributing 📉" if row["distribution"] else "Neutral")
             colB.metric("Flow Status", status)
             colC.metric("Foreign Control", f"{row['foreign_participation']*100:.1f}%" if pd.notna(row['foreign_participation']) else "N/A")
@@ -262,8 +291,8 @@ with right_col:
             st.plotly_chart(fig, use_container_width=True)
             colA, colB, colC = st.columns(3)
             colA.metric("Last Value Shift", f"{row['nilai_chg_last']*100:.1f}%" if pd.notna(row['nilai_chg_last']) else "N/A")
-            colB.metric(f"Avg Value ({lookback_days}D)", f"{row['avg_nilai_window']/1e9:,.2f} M".replace(",", "."))
-            colC.metric("Consistency Floor", f"{row['nilai_consistency']/1e9:,.2f} M".replace(",", "."))
+            colB.metric(f"Avg Value ({lookback_days}D)", fmt_id(row["avg_nilai_window"]/1e9, 2, "M"))
+            colC.metric("Consistency Floor", fmt_id(row["nilai_consistency"]/1e9, 2, "M"))
 
         with tabs[4]:
             fig = go.Figure()
@@ -271,8 +300,8 @@ with right_col:
             fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Volume")
             st.plotly_chart(fig, use_container_width=True)
             colA, colB, colC, colD = st.columns(4)
-            colA.metric("Total Bid", f"{row['Bid Volume']:,.0f}".replace(",", "."))
-            colB.metric("Total Offer", f"{row['Offer Volume']:,.0f}".replace(",", "."))
+            colA.metric("Total Bid", fmt_id(row["Bid Volume"]))
+            colB.metric("Total Offer", fmt_id(row["Offer Volume"]))
             colC.metric("Dominance (Bid)", f"{row['bid_offer_dominance']*100:.1f}%" if pd.notna(row['bid_offer_dominance']) else "N/A")
             colD.metric("Spread Gap", f"{row['spread_pct']*100:.2f}%" if pd.notna(row['spread_pct']) else "N/A")
 
@@ -288,15 +317,15 @@ with right_col:
 
         with tabs[6]:
             summary = {
-                "Last Price": f"{row['Penutupan']:,.0f}",
-                "Volume": f"{row['Volume']:,.0f}",
-                "Value": f"{row['Nilai']:,.0f}",
-                "Frequency": f"{row['Frekuensi']:,.0f}",
-                "Foreign Buy": f"{row['Foreign Buy']:,.0f}",
-                "Foreign Sell": f"{row['Foreign Sell']:,.0f}",
+                "Last Price": fmt_id(row["Penutupan"]),
+                "Volume": fmt_id(row["Volume"]),
+                "Value": fmt_id(row["Nilai"]),
+                "Frequency": fmt_id(row["Frekuensi"]),
+                "Foreign Buy": fmt_id(row["Foreign Buy"]),
+                "Foreign Sell": fmt_id(row["Foreign Sell"]),
                 "Free Float (Proxy)": f"{row['free_float_ratio']*100:.1f}%" if pd.notna(row['free_float_ratio']) else "N/A",
                 "Turnover Ratio": f"{row['turnover_ratio']*100:.3f}%" if pd.notna(row['turnover_ratio']) else "N/A",
-                "Market Cap (Proxy)": f"{row['market_cap_proxy']/1e12:,.2f} T" if pd.notna(row['market_cap_proxy']) else "N/A",
+                "Market Cap (Proxy)": fmt_id(row["market_cap_proxy"]/1e12, 2, "T") if pd.notna(row['market_cap_proxy']) else "N/A",
                 f"Volatility ({lookback_days}D)": f"{row['volatility']*100:.2f}%" if pd.notna(row['volatility']) else "N/A",
             }
             st.table(pd.DataFrame(summary.items(), columns=["Metric", "Reading"]))
